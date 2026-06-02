@@ -20,7 +20,6 @@ except ImportError:
     print("⚠️ pdf2docx not available, will return DOCX format")
 
 def extract_fields_from_docx(docx_bytes):
-    """Extract all fields from DOCX"""
     doc = Document(io.BytesIO(docx_bytes))
     text = '\n'.join([para.text for para in doc.paragraphs])
     
@@ -42,7 +41,6 @@ def extract_fields_from_docx(docx_bytes):
     return fields
 
 def replace_fields_in_docx(docx_bytes, field_values):
-    """Replace placeholders with actual values"""
     doc = Document(io.BytesIO(docx_bytes))
     
     for paragraph in doc.paragraphs:
@@ -78,7 +76,6 @@ def replace_fields_in_docx(docx_bytes, field_values):
     return output
 
 def convert_docx_to_pdf(docx_bytes):
-    """Convert DOCX to PDF using pdf2docx"""
     if not PDF_SUPPORT:
         return docx_bytes
     
@@ -105,19 +102,7 @@ def convert_docx_to_pdf(docx_bytes):
     except Exception as e:
         print(f"PDF conversion error: {e}")
         return docx_bytes
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        'service': 'DOCX to PDF Service',
-        'status': 'running',
-        'endpoints': {
-            '/health': 'GET - Health check',
-            '/parse-docx': 'POST - Parse DOCX and detect fields',
-            '/fill-and-pdf': 'POST - Fill fields and return PDF',
-            '/fill-and-return-docx': 'POST - Fill fields and return DOCX'
-        }
-    })
-    
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
