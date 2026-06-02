@@ -10,14 +10,14 @@ import tempfile
 app = Flask(__name__)
 CORS(app)
 
-# PDF support flag
+# Try to import pdf2docx
 PDF_SUPPORT = False
 try:
     from pdf2docx import Converter
     PDF_SUPPORT = True
     print("✅ pdf2docx loaded, PDF support enabled")
-except ImportError:
-    print("⚠️ pdf2docx not available, will return DOCX format")
+except ImportError as e:
+    print(f"⚠️ pdf2docx not available: {e}")
 
 def extract_fields_from_docx(docx_bytes):
     doc = Document(io.BytesIO(docx_bytes))
@@ -43,6 +43,7 @@ def extract_fields_from_docx(docx_bytes):
 def replace_fields_in_docx(docx_bytes, field_values):
     doc = Document(io.BytesIO(docx_bytes))
     
+    # Replace in paragraphs
     for paragraph in doc.paragraphs:
         for field_name, field_value in field_values.items():
             patterns = [
@@ -55,6 +56,7 @@ def replace_fields_in_docx(docx_bytes, field_values):
                 if pattern in paragraph.text:
                     paragraph.text = paragraph.text.replace(pattern, str(field_value))
     
+    # Replace in tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -76,7 +78,9 @@ def replace_fields_in_docx(docx_bytes, field_values):
     return output
 
 def convert_docx_to_pdf(docx_bytes):
+    """Convert DOCX to PDF using pdf2docx"""
     if not PDF_SUPPORT:
+        print("⚠️ PDF support not available, returning DOCX")
         return docx_bytes
     
     try:
@@ -97,10 +101,11 @@ def convert_docx_to_pdf(docx_bytes):
         os.unlink(temp_docx_path)
         os.unlink(temp_pdf_path)
         
+        print(f"✅ PDF converted successfully, size: {len(pdf_bytes)} bytes")
         return pdf_bytes
         
     except Exception as e:
-        print(f"PDF conversion error: {e}")
+        print(f"❌ PDF conversion error: {e}")
         return docx_bytes
 
 @app.route('/health', methods=['GET'])
@@ -134,6 +139,9 @@ def parse_docx():
 def fill_and_pdf():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No JSON data provided'}), 400
+        
         docx_base64 = data.get('docxBase64')
         field_values = data.get('fieldValues', {})
         title = data.get('title', 'signed_document')
@@ -141,18 +149,24 @@ def fill_and_pdf():
         if not docx_base64:
             return jsonify({'success': False, 'error': 'No document provided'}), 400
         
+        print(f"📄 Processing document: {title}")
+        print(f"📝 Fields to fill: {list(field_values.keys())}")
+        
         docx_bytes = base64.b64decode(docx_base64)
         filled_docx = replace_fields_in_docx(docx_bytes, field_values)
         filled_bytes = filled_docx.getvalue()
         
         output_bytes = convert_docx_to_pdf(filled_bytes)
         
+        # Determine content type
         if output_bytes != filled_bytes:
             content_type = 'application/pdf'
             extension = 'pdf'
+            print(f"✅ Returning PDF, size: {len(output_bytes)} bytes")
         else:
             content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             extension = 'docx'
+            print(f"⚠️ PDF conversion failed, returning DOCX, size: {len(output_bytes)} bytes")
         
         return send_file(
             io.BytesIO(output_bytes),
@@ -162,6 +176,7 @@ def fill_and_pdf():
         )
     
     except Exception as e:
+        print(f"❌ Error in fill-and-pdf: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/fill-and-return-docx', methods=['POST'])
