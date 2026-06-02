@@ -105,7 +105,19 @@ def convert_docx_to_pdf(docx_bytes):
     except Exception as e:
         print(f"PDF conversion error: {e}")
         return docx_bytes
-
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'service': 'DOCX to PDF Service',
+        'status': 'running',
+        'endpoints': {
+            '/health': 'GET - Health check',
+            '/parse-docx': 'POST - Parse DOCX and detect fields',
+            '/fill-and-pdf': 'POST - Fill fields and return PDF',
+            '/fill-and-return-docx': 'POST - Fill fields and return DOCX'
+        }
+    })
+    
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
