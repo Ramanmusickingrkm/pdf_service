@@ -1,29 +1,30 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-import mammoth
 from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import re
 import os
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+import base64
 import tempfile
 
 app = Flask(__name__)
 CORS(app)
 
+# PDF support flag
+PDF_SUPPORT = False
+try:
+    from pdf2docx import Converter
+    PDF_SUPPORT = True
+    print("✅ pdf2docx loaded, PDF support enabled")
+except ImportError:
+    print("⚠️ pdf2docx not available, will return DOCX format")
+
 def extract_fields_from_docx(docx_bytes):
-    """Extract all fields from DOCX (placeholders like {{field}}, [field])"""
+    """Extract all fields from DOCX"""
     doc = Document(io.BytesIO(docx_bytes))
     text = '\n'.join([para.text for para in doc.paragraphs])
     
     fields = []
-    # Find all placeholders
     patterns = [
         r'\{\{([^}]+)\}\}',
         r'\[([^\]]+)\]',
@@ -41,7 +42,7 @@ def extract_fields_from_docx(docx_bytes):
     return fields
 
 def replace_fields_in_docx(docx_bytes, field_values):
-    """Replace placeholders in DOCX with actual values"""
+    """Replace placeholders with actual values"""
     doc = Document(io.BytesIO(docx_bytes))
     
     for paragraph in doc.paragraphs:
@@ -77,11 +78,11 @@ def replace_fields_in_docx(docx_bytes, field_values):
     return output
 
 def convert_docx_to_pdf(docx_bytes):
-    """Convert DOCX to PDF using reportlab"""
+    """Convert DOCX to PDF using pdf2docx"""
+    if not PDF_SUPPORT:
+        return docx_bytes
+    
     try:
-        from pdf2docx import Converter
-        import tempfile
-        
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
             temp_docx.write(docx_bytes)
             temp_docx_path = temp_docx.name
@@ -101,60 +102,95 @@ def convert_docx_to_pdf(docx_bytes):
         
         return pdf_bytes
         
-    except ImportError:
-        # Fallback: Return DOCX as is
+    except Exception as e:
+        print(f"PDF conversion error: {e}")
         return docx_bytes
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'service': 'docx-pdf-service',
+        'pdf_support': PDF_SUPPORT
+    })
 
 @app.route('/parse-docx', methods=['POST'])
 def parse_docx():
-    """Parse DOCX and detect fields"""
     try:
-        file = request.files['file']
-        if not file:
-            return {'success': False, 'error': 'No file uploaded'}, 400
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
         
+        file = request.files['file']
         docx_bytes = file.read()
         fields = extract_fields_from_docx(docx_bytes)
         
-        return {
+        return jsonify({
             'success': True,
             'fields': [{'name': f, 'label': f.replace('_', ' ').title(), 'type': 'text'} for f in fields],
             'message': f'Found {len(fields)} fields'
-        }
+        })
     
     except Exception as e:
-        return {'success': False, 'error': str(e)}, 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/fill-and-pdf', methods=['POST'])
 def fill_and_pdf():
-    """Fill fields in DOCX and return PDF"""
     try:
-        data = request.json
+        data = request.get_json()
         docx_base64 = data.get('docxBase64')
         field_values = data.get('fieldValues', {})
         title = data.get('title', 'signed_document')
         
         if not docx_base64:
-            return {'success': False, 'error': 'No document provided'}, 400
+            return jsonify({'success': False, 'error': 'No document provided'}), 400
         
-        import base64
         docx_bytes = base64.b64decode(docx_base64)
-        
-        # Fill fields in DOCX
         filled_docx = replace_fields_in_docx(docx_bytes, field_values)
+        filled_bytes = filled_docx.getvalue()
         
-        # Convert to PDF
-        pdf_bytes = convert_docx_to_pdf(filled_docx.getvalue())
+        output_bytes = convert_docx_to_pdf(filled_bytes)
+        
+        if output_bytes != filled_bytes:
+            content_type = 'application/pdf'
+            extension = 'pdf'
+        else:
+            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            extension = 'docx'
         
         return send_file(
-            io.BytesIO(pdf_bytes),
-            mimetype='application/pdf',
+            io.BytesIO(output_bytes),
+            mimetype=content_type,
             as_attachment=True,
-            download_name=f'{title}_signed.pdf'
+            download_name=f'{title.replace("/", "_")}_signed.{extension}'
         )
     
     except Exception as e:
-        return {'success': False, 'error': str(e)}, 500
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/fill-and-return-docx', methods=['POST'])
+def fill_and_return_docx():
+    try:
+        data = request.get_json()
+        docx_base64 = data.get('docxBase64')
+        field_values = data.get('fieldValues', {})
+        title = data.get('title', 'signed_document')
+        
+        if not docx_base64:
+            return jsonify({'success': False, 'error': 'No document provided'}), 400
+        
+        docx_bytes = base64.b64decode(docx_base64)
+        filled_docx = replace_fields_in_docx(docx_bytes, field_values)
+        
+        return send_file(
+            io.BytesIO(filled_docx.getvalue()),
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            as_attachment=True,
+            download_name=f'{title.replace("/", "_")}_filled.docx'
+        )
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
