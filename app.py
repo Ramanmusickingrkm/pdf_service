@@ -13,54 +13,134 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def extract_fields_from_text(text):
+    """Extract all field names from text"""
+    fields = []
+    patterns = [
+        r'\{\{([^}]+)\}\}',   # {{field}}
+        r'\[([^\]]+)\]',       # [field]
+        r'__([^_]+)__',        # __field__
+        r'\$([^$]+)\$'         # $field$
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            field_name = match.strip()
+            if field_name and field_name not in fields:
+                fields.append(field_name)
+    
+    return fields
+
+def get_field_mapping(docx_bytes):
+    """Detect all fields in DOCX and create name mapping"""
+    doc = Document(io.BytesIO(docx_bytes))
+    text = '\n'.join([para.text for para in doc.paragraphs])
+    
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    text += '\n' + para.text
+    
+    fields = extract_fields_from_text(text)
+    logger.info(f'🔍 Detected fields in template: {fields}')
+    
+    # Create mapping (normalize field names)
+    mapping = {}
+    for field in fields:
+        # Create normalized key (lowercase, no spaces, underscores instead of spaces)
+        normalized = re.sub(r'[^a-zA-Z0-9]', '_', field.lower())
+        mapping[normalized] = field
+        logger.info(f'  📌 "{field}" -> normalized: "{normalized}"')
+    
+    return mapping, fields
+
 def replace_fields_in_docx(docx_bytes, field_values):
     """Replace placeholders in DOCX while preserving ALL formatting"""
     try:
         doc = Document(io.BytesIO(docx_bytes))
         
-        logger.info(f'📝 Replacing {len(field_values)} field values in DOCX')
+        # First, detect all fields in the document and create mapping
+        field_mapping, detected_fields = get_field_mapping(docx_bytes)
         
-        # Process paragraphs - preserve all formatting
+        logger.info(f'📝 Received field values: {list(field_values.keys())}')
+        logger.info(f'📝 Detected template fields: {detected_fields}')
+        
+        # Create replacement dictionary
+        replacements = {}
+        for template_field in detected_fields:
+            # Try direct match first
+            if template_field in field_values:
+                replacements[template_field] = str(field_values[template_field])
+                logger.info(f'  ✓ Direct match: {template_field} -> {replacements[template_field][:50]}')
+            else:
+                # Try normalized match
+                normalized = re.sub(r'[^a-zA-Z0-9]', '_', template_field.lower())
+                if normalized in field_values:
+                    replacements[template_field] = str(field_values[normalized])
+                    logger.info(f'  ✓ Normalized match: {template_field} (normalized: {normalized}) -> {replacements[template_field][:50]}')
+                else:
+                    # Check case-insensitive
+                    for key in field_values.keys():
+                        if key.lower() == template_field.lower():
+                            replacements[template_field] = str(field_values[key])
+                            logger.info(f'  ✓ Case-insensitive match: {template_field} -> {replacements[template_field][:50]}')
+                            break
+        
+        if not replacements:
+            logger.warning('⚠️ No field replacements found! Check field name matching.')
+            logger.warning(f'   Available field values: {list(field_values.keys())}')
+            logger.warning(f'   Detected template fields: {detected_fields}')
+        
+        # Process paragraphs
         for paragraph in doc.paragraphs:
             original_text = paragraph.text
             new_text = original_text
             
-            for field_name, field_value in field_values.items():
-                if field_name and field_value:
-                    field_str = str(field_value)
-                    patterns = [
-                        f'{{{{{field_name}}}}}',
-                        f'[{field_name}]',
-                        f'__{field_name}__',
-                        f'${field_name}$'
-                    ]
-                    for pattern in patterns:
-                        if pattern in new_text:
-                            new_text = new_text.replace(pattern, field_str)
-                            logger.info(f'  ✓ Replaced {pattern} -> {field_str[:50]}')
+            for template_field, replacement_value in replacements.items():
+                if not replacement_value:
+                    continue
+                
+                # Try all pattern formats
+                patterns_to_replace = [
+                    f'{{{{{template_field}}}}}',
+                    f'[{template_field}]',
+                    f'__{template_field}__',
+                    f'${template_field}$'
+                ]
+                
+                for pattern in patterns_to_replace:
+                    if pattern in new_text:
+                        new_text = new_text.replace(pattern, replacement_value)
+                        logger.info(f'  ✓ Replaced {pattern}')
             
-            # Only update if changed - this preserves formatting
             if new_text != original_text:
-                # Replace in runs to preserve character formatting
                 if paragraph.runs:
+                    # Update runs to preserve formatting
+                    full_text = ''.join([run.text for run in paragraph.runs])
+                    for template_field, replacement_value in replacements.items():
+                        if not replacement_value:
+                            continue
+                        patterns_to_replace = [
+                            f'{{{{{template_field}}}}}',
+                            f'[{template_field}]',
+                            f'__{template_field}__',
+                            f'${template_field}$'
+                        ]
+                        for pattern in patterns_to_replace:
+                            if pattern in full_text:
+                                full_text = full_text.replace(pattern, replacement_value)
+                    
                     # Distribute text across runs
-                    for run in paragraph.runs:
-                        if any(pattern in run.text for pattern in ['{{', '[', '__', '$']):
-                            for field_name, field_value in field_values.items():
-                                field_str = str(field_value)
-                                patterns = [
-                                    f'{{{{{field_name}}}}}',
-                                    f'[{field_name}]',
-                                    f'__{field_name}__',
-                                    f'${field_name}$'
-                                ]
-                                for pattern in patterns:
-                                    if pattern in run.text:
-                                        run.text = run.text.replace(pattern, field_str)
+                    if full_text != original_text:
+                        # Clear all runs and create new one
+                        paragraph.clear()
+                        paragraph.add_run(full_text)
                 else:
                     paragraph.text = new_text
         
-        # Process tables - preserve formatting
+        # Process tables
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
@@ -68,33 +148,38 @@ def replace_fields_in_docx(docx_bytes, field_values):
                         original_text = paragraph.text
                         new_text = original_text
                         
-                        for field_name, field_value in field_values.items():
-                            if field_name and field_value:
-                                field_str = str(field_value)
-                                patterns = [
-                                    f'{{{{{field_name}}}}}',
-                                    f'[{field_name}]',
-                                    f'__{field_name}__',
-                                    f'${field_name}$'
-                                ]
-                                for pattern in patterns:
-                                    if pattern in new_text:
-                                        new_text = new_text.replace(pattern, field_str)
+                        for template_field, replacement_value in replacements.items():
+                            if not replacement_value:
+                                continue
+                            patterns_to_replace = [
+                                f'{{{{{template_field}}}}}',
+                                f'[{template_field}]',
+                                f'__{template_field}__',
+                                f'${template_field}$'
+                            ]
+                            for pattern in patterns_to_replace:
+                                if pattern in new_text:
+                                    new_text = new_text.replace(pattern, replacement_value)
                         
                         if new_text != original_text:
                             if paragraph.runs:
-                                for run in paragraph.runs:
-                                    for field_name, field_value in field_values.items():
-                                        field_str = str(field_value)
-                                        patterns = [
-                                            f'{{{{{field_name}}}}}',
-                                            f'[{field_name}]',
-                                            f'__{field_name}__',
-                                            f'${field_name}$'
-                                        ]
-                                        for pattern in patterns:
-                                            if pattern in run.text:
-                                                run.text = run.text.replace(pattern, field_str)
+                                full_text = ''.join([run.text for run in paragraph.runs])
+                                for template_field, replacement_value in replacements.items():
+                                    if not replacement_value:
+                                        continue
+                                    patterns_to_replace = [
+                                        f'{{{{{template_field}}}}}',
+                                        f'[{template_field}]',
+                                        f'__{template_field}__',
+                                        f'${template_field}$'
+                                    ]
+                                    for pattern in patterns_to_replace:
+                                        if pattern in full_text:
+                                            full_text = full_text.replace(pattern, replacement_value)
+                                
+                                if full_text != original_text:
+                                    paragraph.clear()
+                                    paragraph.add_run(full_text)
                             else:
                                 paragraph.text = new_text
         
@@ -106,6 +191,8 @@ def replace_fields_in_docx(docx_bytes, field_values):
         
     except Exception as e:
         logger.error(f'❌ Error replacing fields: {str(e)}')
+        import traceback
+        traceback.print_exc()
         return None
 
 @app.route('/health', methods=['GET'])
@@ -139,24 +226,21 @@ def parse_docx():
                     for para in cell.paragraphs:
                         text += '\n' + para.text
         
-        fields = []
-        patterns = [
-            r'\{\{([^}]+)\}\}',
-            r'\[([^\]]+)\]',
-            r'__([^_]+)__',
-            r'\$([^$]+)\$'
-        ]
+        fields = extract_fields_from_text(text)
         
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                field_name = match.strip()
-                if field_name and field_name not in fields:
-                    fields.append(field_name)
+        # Also provide normalized versions for frontend
+        field_list = []
+        for field in fields:
+            field_list.append({
+                'name': field,
+                'normalized': re.sub(r'[^a-zA-Z0-9]', '_', field.lower()),
+                'label': field.replace('_', ' ').title(),
+                'type': 'text'
+            })
         
         return {
             'success': True,
-            'fields': [{'name': f, 'label': f.replace('_', ' ').title(), 'type': 'text'} for f in fields],
+            'fields': field_list,
             'message': f'Found {len(fields)} fields'
         }
     
@@ -177,7 +261,7 @@ def fill_and_pdf():
         title = data.get('title', 'signed_document')
         
         logger.info(f'📊 Title: {title}')
-        logger.info(f'📋 Fields to fill: {list(field_values.keys())}')
+        logger.info(f'📋 Received field values: {list(field_values.keys())}')
         
         if not docx_base64:
             return {'success': False, 'error': 'No document provided'}, 400
@@ -189,7 +273,7 @@ def fill_and_pdf():
         except Exception as e:
             return {'success': False, 'error': f'Failed to decode DOCX: {str(e)}'}, 400
         
-        # Fill fields in DOCX (preserves formatting)
+        # Fill fields in DOCX
         filled_docx_io = replace_fields_in_docx(docx_bytes, field_values)
         
         if not filled_docx_io:
@@ -197,7 +281,6 @@ def fill_and_pdf():
         
         logger.info(f'✅ Returning filled DOCX: {title}_filled.docx')
         
-        # Return filled DOCX (NOT PDF) - Let Node.js handle PDF conversion
         return send_file(
             io.BytesIO(filled_docx_io.getvalue()),
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
