@@ -1,30 +1,21 @@
 from flask import Flask, request, send_file
 from flask_cors import CORS
-import mammoth
 from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import re
-import os
 import base64
+import subprocess
 import tempfile
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
+import os
 
 app = Flask(__name__)
 CORS(app)
 
 def extract_fields_from_docx(docx_bytes):
-    """Extract all fields from DOCX (placeholders like {{field}}, [field])"""
+    """Extract all fields from DOCX"""
     doc = Document(io.BytesIO(docx_bytes))
     text = '\n'.join([para.text for para in doc.paragraphs])
     
-    # Also check tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -49,104 +40,87 @@ def extract_fields_from_docx(docx_bytes):
     return fields
 
 def replace_fields_in_docx(docx_bytes, field_values):
-    """Replace placeholders in DOCX with actual values - PRESERVES FORMATTING"""
+    """Replace placeholders in DOCX"""
     doc = Document(io.BytesIO(docx_bytes))
     
-    def replace_in_paragraph(paragraph, field_values):
+    def replace_in_paragraph(paragraph):
         for field_name, field_value in field_values.items():
             if not field_value:
                 continue
-                
             patterns = [
                 f'{{{{{field_name}}}}}',
                 f'[{field_name}]',
                 f'__{field_name}__',
                 f'${field_name}$'
             ]
-            
             for pattern in patterns:
                 if pattern in paragraph.text:
-                    # Replace while preserving runs if possible
-                    if hasattr(paragraph, 'runs') and paragraph.runs:
-                        # Replace in first run that contains the pattern
-                        for run in paragraph.runs:
-                            if pattern in run.text:
-                                run.text = run.text.replace(pattern, str(field_value))
-                                break
-                        else:
-                            # If not found in any run, replace whole paragraph text
-                            paragraph.text = paragraph.text.replace(pattern, str(field_value))
-                    else:
-                        paragraph.text = paragraph.text.replace(pattern, str(field_value))
+                    paragraph.text = paragraph.text.replace(pattern, str(field_value))
     
-    # Replace in paragraphs
     for paragraph in doc.paragraphs:
-        replace_in_paragraph(paragraph, field_values)
+        replace_in_paragraph(paragraph)
     
-    # Replace in tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
-                    replace_in_paragraph(paragraph, field_values)
+                    replace_in_paragraph(paragraph)
     
     output = io.BytesIO()
     doc.save(output)
     output.seek(0)
     return output
 
-def convert_docx_to_pdf_fixed(docx_bytes):
-    """Convert DOCX to PDF using python-docx2pdf or alternative method"""
+def convert_docx_to_pdf_libreoffice(docx_bytes):
+    """Convert DOCX to PDF using LibreOffice (headless)"""
+    temp_docx_path = None
+    temp_pdf_path = None
     
-    # Method 1: Try using docx2pdf (best option)
     try:
-        from docx2pdf import convert
-        import tempfile
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as f:
+            f.write(docx_bytes)
+            temp_docx_path = f.name
         
-        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
-            temp_docx.write(docx_bytes)
-            temp_docx_path = temp_docx.name
+        output_dir = tempfile.mkdtemp()
         
-        pdf_path = temp_docx_path.replace('.docx', '.pdf')
-        convert(temp_docx_path, pdf_path)
+        # Convert using LibreOffice
+        result = subprocess.run([
+            'libreoffice', '--headless', '--convert-to', 'pdf',
+            '--outdir', output_dir, temp_docx_path
+        ], capture_output=True, text=True, timeout=60)
         
-        with open(pdf_path, 'rb') as f:
-            pdf_bytes = f.read()
+        if result.returncode != 0:
+            print(f"LibreOffice error: {result.stderr}")
+            return None
         
+        # Expected PDF path
+        pdf_name = os.path.basename(temp_docx_path).replace('.docx', '.pdf')
+        temp_pdf_path = os.path.join(output_dir, pdf_name)
+        
+        if os.path.exists(temp_pdf_path):
+            with open(temp_pdf_path, 'rb') as f:
+                pdf_bytes = f.read()
+            return pdf_bytes
+        else:
+            print("PDF file not created")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        print("LibreOffice conversion timeout")
+        return None
+    except Exception as e:
+        print(f"Conversion error: {e}")
+        return None
+    finally:
         # Cleanup
-        os.unlink(temp_docx_path)
-        if os.path.exists(pdf_path):
-            os.unlink(pdf_path)
-        
-        return pdf_bytes
-        
-    except ImportError:
-        pass
-    
-    # Method 2: Use pdfkit with wkhtmltopdf (requires HTML conversion)
-    try:
-        import mammoth
-        import pdfkit
-        
-        # Convert DOCX to HTML
-        with open(temp_docx_path, 'rb') as f:
-            result = mammoth.convert_to_html(f)
-            html = result.value
-        
-        # Convert HTML to PDF
-        pdf_bytes = pdfkit.from_string(html, False)
-        return pdf_bytes
-        
-    except ImportError:
-        pass
-    
-    # Method 3: Simple fallback - return DOCX
-    print("⚠️ No PDF converter available, returning DOCX")
-    return docx_bytes
+        if temp_docx_path and os.path.exists(temp_docx_path):
+            os.unlink(temp_docx_path)
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            os.unlink(temp_pdf_path)
 
 @app.route('/parse-docx', methods=['POST'])
 def parse_docx():
-    """Parse DOCX and detect fields"""
     try:
         file = request.files['file']
         if not file:
@@ -160,14 +134,12 @@ def parse_docx():
             'fields': [{'name': f, 'label': f.replace('_', ' ').title(), 'type': 'text'} for f in fields],
             'message': f'Found {len(fields)} fields'
         }
-    
     except Exception as e:
-        print(f"Parse error: {str(e)}")
         return {'success': False, 'error': str(e)}, 500
 
 @app.route('/fill-and-pdf', methods=['POST'])
 def fill_and_pdf():
-    """Fill fields in DOCX and return PDF"""
+    """Fill fields and return PDF"""
     try:
         data = request.json
         docx_base64 = data.get('docxBase64')
@@ -177,35 +149,35 @@ def fill_and_pdf():
         if not docx_base64:
             return {'success': False, 'error': 'No document provided'}, 400
         
-        print(f"📄 Filling document: {title}")
-        print(f"📝 Fields to fill: {list(field_values.keys())}")
-        
         docx_bytes = base64.b64decode(docx_base64)
-        
-        # Fill fields in DOCX
         filled_docx = replace_fields_in_docx(docx_bytes, field_values)
         
         # Convert to PDF
-        pdf_bytes = convert_docx_to_pdf_fixed(filled_docx.getvalue())
+        pdf_bytes = convert_docx_to_pdf_libreoffice(filled_docx.getvalue())
         
-        print(f"✅ PDF generated: {len(pdf_bytes)} bytes")
-        
-        return send_file(
-            io.BytesIO(pdf_bytes),
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'{title}_signed.pdf'
-        )
+        if pdf_bytes:
+            return send_file(
+                io.BytesIO(pdf_bytes),
+                mimetype='application/pdf',
+                as_attachment=True,
+                download_name=f'{title}_signed.pdf'
+            )
+        else:
+            # Fallback: Return DOCX
+            return send_file(
+                io.BytesIO(filled_docx.getvalue()),
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                as_attachment=True,
+                download_name=f'{title}_signed.docx'
+            )
     
     except Exception as e:
-        print(f"❌ Fill and PDF error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error: {str(e)}")
         return {'success': False, 'error': str(e)}, 500
 
 @app.route('/fill-and-return-docx', methods=['POST'])
 def fill_and_return_docx():
-    """Fill fields in DOCX and return DOCX (no PDF conversion)"""
+    """Return DOCX only (no PDF conversion)"""
     try:
         data = request.json
         docx_base64 = data.get('docxBase64')
@@ -216,8 +188,6 @@ def fill_and_return_docx():
             return {'success': False, 'error': 'No document provided'}, 400
         
         docx_bytes = base64.b64decode(docx_base64)
-        
-        # Fill fields in DOCX
         filled_docx = replace_fields_in_docx(docx_bytes, field_values)
         
         return send_file(
@@ -228,7 +198,6 @@ def fill_and_return_docx():
         )
     
     except Exception as e:
-        print(f"❌ Fill DOCX error: {str(e)}")
         return {'success': False, 'error': str(e)}, 500
 
 @app.route('/health', methods=['GET'])
