@@ -5,10 +5,10 @@ import io
 import re
 import base64
 import logging
-from datetime import datetime
+from datetime datetime
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})  # 🔥 Enable CORS for all routes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -79,17 +79,23 @@ def replace_fields_in_docx(docx_bytes, field_values):
         traceback.print_exc()
         return None
 
-@app.route('/health', methods=['GET'])
+@app.route('/health', methods=['GET', 'OPTIONS'])
 def health():
+    if request.method == 'OPTIONS':
+        return '', 200
     return {
         'status': 'ok',
         'service': 'DocSign DOCX Filler Service',
         'timestamp': datetime.now().isoformat()
     }
 
-@app.route('/fill-and-pdf', methods=['POST'])
+@app.route('/fill-and-pdf', methods=['POST', 'OPTIONS'])
 def fill_and_pdf():
     """Fill fields in DOCX and return filled DOCX"""
+    if request.method == 'OPTIONS':
+        response = '', 200
+        return response
+    
     try:
         data = request.json
         if not data:
@@ -133,7 +139,7 @@ def fill_and_pdf():
         traceback.print_exc()
         return {'success': False, 'error': str(e)}, 500
 
-@app.route('/fill-and-return-docx', methods=['POST'])
+@app.route('/fill-and-return-docx', methods=['POST', 'OPTIONS'])
 def fill_and_return_docx():
     return fill_and_pdf()
 
